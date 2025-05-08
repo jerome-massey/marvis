@@ -46,9 +46,8 @@ class TroubleshootingManager:
             "model_name": settings.llm.model_name,
             "temperature": settings.llm.temperature,
             "max_tokens": settings.llm.max_tokens,
-            # Consider adding system_prompt_template and pyats_capabilities_prompt_section
-            # from settings if they are to be configurable at this level.
-            # For now, llm_handler uses its defaults or those passed here.
+            # System prompt and capabilities prompt sections can be customized in llm_handler.py
+            # or passed via settings if more dynamic configuration is needed here.
         }
         self.llm_handler = LLMHandler(llm_config=llm_handler_config)
         logger.info(f"LLMHandler initialized with provider: {settings.llm.provider}, model: {settings.llm.model_name}")
@@ -146,36 +145,83 @@ class TroubleshootingManager:
                 logger.info(f"Executing {len(llm_data_request.pyats_commands)} command(s) via PyATSHandler.")
                 # This part needs to be fleshed out when PyATSHandler is fully implemented.
                 # For now, a simplified loop.
+                # This will be replaced by a more robust call that aggregates results.
+                all_commands_to_run_on_devices: Dict[str, List[str]] = {} # device_name -> list of commands
+                
                 for cmd_req in llm_data_request.pyats_commands:
-                    devices_to_run_on = cmd_req.devices or target_scope.device_hostnames or []
-                    if not devices_to_run_on:
-                        logger.warning(f"No target devices specified for command '{cmd_req.command}', skipping.")
+                    devices_for_this_command = cmd_req.devices or target_scope.device_hostnames or []
+                    if not devices_for_this_command:
+                        logger.warning(f"No target devices specified by LLM for command '{cmd_req.command}', skipping.")
+                        continue
+                    for device_name in devices_for_this_command:
+                        if device_name not in all_commands_to_run_on_devices:
+                            all_commands_to_run_on_devices[device_name] = []
+                        # Ensure no duplicate commands for the same device from this initial request
+                        if cmd_req.command not in all_commands_to_run_on_devices[device_name]:
+                             all_commands_to_run_on_devices[device_name].append(cmd_req.command)
+
+                # Execute commands device by device (or command by command, depending on PyATSHandler's design)
+                # Current PyATSHandler executes one command on multiple devices.
+                # We might need to iterate through unique commands and call it,
+                # or enhance PyATSHandler to take a list of commands for a list of devices.
+                # For now, let's iterate through commands suggested by LLM and run each on its target devices.
+
+                unique_commands_from_llm = list(set(cmd_req.command for cmd_req in llm_data_request.pyats_commands if cmd_req.command))
+
+                for command_str in unique_commands_from_llm:
+                    # Determine which devices this specific command needs to run on based on LLM's request
+                    devices_for_current_command = []
+                    for cmd_req in llm_data_request.pyats_commands:
+                        if cmd_req.command == command_str:
+                            devices_for_current_command.extend(cmd_req.devices or target_scope.device_hostnames or [])
+                    
+                    # Remove duplicates while preserving order (though order might not be critical here)
+                    unique_devices_for_command = sorted(list(set(d for d in devices_for_current_command if d)))
+
+
+                    if not unique_devices_for_command:
+                        logger.warning(f"No target devices ultimately resolved for command '{command_str}', skipping.")
                         continue
                     
-                    # Conceptual: pyats_handler.execute_commands_on_devices would handle multiple devices
-                    # For now, let's assume it processes one command on multiple devices.
-                    # results, conn_tests = await self.pyats_handler.execute_command_on_devices(
-                    #     devices=devices_to_run_on,
-                    #     command=cmd_req.command
-                    # )
-                    # collected_pyats_results.extend(results)
-                    # connectivity_test_results_agg.extend(conn_tests)
-                    logger.warning(f"PyATS command execution for '{cmd_req.command}' is stubbed.")
-                    # Add dummy results for now to allow flow to continue
-                    for device_name in devices_to_run_on:
-                        collected_pyats_results.append(PyATSCommandResult(
-                            device_hostname=device_name,
-                            command=cmd_req.command,
-                            raw_output=f"Stubbed output for {cmd_req.command} on {device_name}",
-                            error="Stubbed execution - PyATSHandler not fully integrated."
-                        ))
-                investigation_summary += f" Attempted to run {len(llm_data_request.pyats_commands)} types of commands."
-            elif not self.pyats_handler:
-                logger.warning("PyATSHandler not available. Skipping command execution.")
-                investigation_summary += " PyATSHandler not available, commands not executed."
+                    logger.info(f"Executing command '{command_str}' on devices: {unique_devices_for_command} via PyATSHandler.")
+                    results, conn_tests = await self.pyats_handler.execute_command_on_devices(
+                        device_names=unique_devices_for_command,
+                        command_to_execute=command_str
+                    )
+                    collected_pyats_results.extend(results)
+                    connectivity_test_results_agg.extend(conn_tests)
+                    # Log summary of this specific command execution
+                    for res in results:
+                        if res.error:
+                            logger.warning(f"Error executing '{res.command}' on {res.device_hostname}: {res.error}")
+                        else:
+                            logger.info(f"Successfully executed '{res.command}' on {res.device_hostname}.")
+                    for ct_res in conn_tests:
+                        logger.info(f"Connectivity test {ct_res.test_type} for {ct_res.target}: Success={ct_res.success}")
+
+
+            if collected_pyats_results:
+                investigation_summary += f" Executed {len(unique_commands_from_llm)} unique command(s) across relevant devices."
             else:
-                logger.info("LLM did not request any pyATS commands.")
-                investigation_summary += " LLM did not request specific pyATS commands."
+                investigation_summary += " No pyATS commands were executed based on LLM's request or device availability."
+            
+            # Remove previous stubbed code
+            # logger.warning(f"PyATS command execution for '{cmd_req.command}' is stubbed.")
+            # # Add dummy results for now to allow flow to continue
+            # for device_name in devices_to_run_on:
+            #     collected_pyats_results.append(PyATSCommandResult(
+            #         device_hostname=device_name,
+            #         command=cmd_req.command,
+            #         raw_output=f"Stubbed output for {cmd_req.command} on {device_name}",
+            #         error="Stubbed execution - PyATSHandler not fully integrated."
+            #     ))
+            # investigation_summary += f" Attempted to run {len(llm_data_request.pyats_commands)} types of commands."
+        elif not self.pyats_handler:
+            logger.warning("PyATSHandler not available. Skipping command execution.")
+            investigation_summary += " PyATSHandler not available, commands not executed."
+        else:
+            logger.info("LLM did not request any pyATS commands.")
+            investigation_summary += " LLM did not request specific pyATS commands."
 
         except Exception as e:
             logger.error(f"Error during initial LLM interaction or pyATS execution: {e}", exc_info=True)
@@ -191,16 +237,17 @@ class TroubleshootingManager:
                 if res.parsed_output:
                     analysis_context_parts.append(f"    Parsed: {str(res.parsed_output)[:200]}...") # Truncate for brevity
                 elif res.raw_output:
-                    analysis_context_parts.append(f"    Raw: {res.raw_output[:200]}...") # Truncate
+                    analysis_context_parts.append(f"    Raw Output: {res.raw_output[:200]}...") # Truncate for brevity
                 if res.error:
                     analysis_context_parts.append(f"    Error: {res.error}")
             
             if connectivity_test_results_agg:
                 analysis_context_parts.append("\\nConnectivity Test Results:")
                 for conn_test in connectivity_test_results_agg:
-                    analysis_context_parts.append(
-                        f"  Target: {conn_test.target}, Type: {conn_test.test_type}, Success: {conn_test.success}, Details: {conn_test.details}"
-                    )
+                    details_str = f"Target: {conn_test.target}, Success: {conn_test.success}"
+                    if conn_test.details:
+                        details_str += f", Details: {str(conn_test.details)[:100]}..."
+                    analysis_context_parts.append(f"  - {conn_test.test_type}: {details_str}")
             
             analysis_context_str = "\\n".join(analysis_context_parts)
             analysis_llm_query = (
@@ -214,237 +261,293 @@ class TroubleshootingManager:
                     user_query=analysis_llm_query,
                     output_model=LLMAnalysisResult,
                     current_context=analysis_context_str
+                    # No pyats_capabilities_summary needed here as we are providing data, not asking for commands
                 )
-                logger.info(f"LLM analysis received: {llm_analysis_result.overall_assessment[:100]}...")
-                investigation_summary += " LLM analysis performed on collected data."
+                logger.info(f"LLM analysis received. Overall assessment: {llm_analysis_result.overall_assessment[:100]}...")
+                investigation_summary += f" LLM analysis completed. Assessment: {llm_analysis_result.overall_assessment[:50]}..."
+
             except Exception as e:
                 logger.error(f"Error during LLM analysis phase: {e}", exc_info=True)
                 investigation_summary += f" Error during LLM analysis: {e}."
-                llm_analysis_result = LLMAnalysisResult( # Provide a fallback
-                    overall_assessment="Error during LLM analysis.",
-                    key_findings=[f"Exception: {e}"],
-                    potential_root_causes=["LLM analysis failed."],
-                    suggested_next_steps=["Review logs for errors."]
+                # Fallback: create a simple LLMAnalysisResult if the LLM call fails
+                llm_analysis_result = LLMAnalysisResult(
+                    overall_assessment="LLM analysis failed. Review collected data manually.",
+                    key_findings=["LLM analysis could not be performed due to an error."],
+                    potential_root_causes=["Error in LLM communication or response processing."],
+                    suggested_next_steps=["Check logs for LLMHandler errors.", "Review raw pyATS data if collected."]
                 )
-        elif not llm_data_request.ask_user_clarification: # If no data and no clarification, make a simple assessment
+        elif not llm_data_request or not llm_data_request.pyats_commands and not llm_data_request.ask_user_clarification : # If no data and no clarification, make a simple assessment
              try:
-                logger.debug("No pyATS data, attempting simple LLM assessment based on alarm.")
+                logger.info("No pyATS data collected and no clarification requested by LLM. Generating simple assessment.")
                 simple_assessment_query = (
-                    "Based on the alarm details alone, provide a very brief initial assessment and "
-                    "suggest generic next steps or checks that could be performed manually, "
-                    "as no automated commands were run or data was collected."
+                    "Based on the initial alarm details only, provide a very brief initial assessment "
+                    "and suggest generic next steps for investigation, as no specific device data "
+                    "was requested or collected."
                 )
                 llm_analysis_result = await self.llm_handler.get_structured_response(
                     user_query=simple_assessment_query,
                     output_model=LLMAnalysisResult,
                     current_context=initial_context_str
                 )
-                investigation_summary += " LLM provided assessment based on alarm details only."
+                investigation_summary += " LLM provided a general assessment based on alarm details only."
+                logger.info(f"LLM simple assessment: {llm_analysis_result.overall_assessment[:100]}...")
              except Exception as e:
                 logger.error(f"Error during simple LLM assessment: {e}", exc_info=True)
                 investigation_summary += f" Error during simple LLM assessment: {e}."
                 llm_analysis_result = LLMAnalysisResult(
-                    overall_assessment="Error during initial LLM assessment (no data collected).",
-                    key_findings=[f"Exception: {e}"],
-                    potential_root_causes=["LLM assessment failed."],
-                    suggested_next_steps=["Review logs for errors, check alarm source."]
+                    overall_assessment="Initial LLM assessment failed. Alarm details may be insufficient or LLM error.",
+                    key_findings=["No device data was collected.", "LLM could not provide an initial assessment."],
+                    potential_root_causes=["Insufficient information from alarm.", "LLM communication error."],
+                    suggested_next_steps=["Manually review alarm details.", "Consider direct device investigation."]
+                )
+        else: # Handles cases like only clarification was asked, or llm_data_request itself failed.
+            logger.info("No pyATS data collected. LLM analysis will be based on initial alarm and any clarifications.")
+            if llm_data_request and llm_data_request.ask_user_clarification:
+                clarification_text = f"LLM requested clarification: {llm_data_request.ask_user_clarification}"
+                investigation_summary += f" {clarification_text}"
+                llm_analysis_result = LLMAnalysisResult(
+                    overall_assessment=f"Further action pending user clarification. {clarification_text}",
+                    key_findings=[clarification_text],
+                    potential_root_causes=["Information insufficient for automated diagnosis without clarification."],
+                    suggested_next_steps=["Provide the requested clarification to proceed."]
+                )
+            else: # llm_data_request might have failed before even asking for clarification or commands
+                 llm_analysis_result = LLMAnalysisResult(
+                    overall_assessment="Initial LLM interaction for data gathering failed or yielded no actions. Cannot proceed with data-driven analysis.",
+                    key_findings=["Failed to determine data gathering steps via LLM."],
+                    potential_root_causes=["Problem with LLM prompt/response or initial alarm data interpretation."],
+                    suggested_next_steps=["Review manager logs for errors in the first LLM call.", "Check alarm details for clarity."]
                 )
 
 
-        # 4. Generate Report (FR13, FR14)
-        # If ReportBuilder is available, use it. Otherwise, construct directly.
-        final_report: TroubleshootingReport
-        if self.report_builder:
-            logger.debug("Using ReportBuilder to generate the report.")
-            # final_report = self.report_builder.generate_report( # This method needs to be defined in ReportBuilder
-            #     request_type="alarm",
-            #     original_request=alarm_details,
-            #     target_scope=target_scope,
-            #     investigation_summary=investigation_summary,
-            #     devices_investigated=investigated_devices, # This should be refined based on actual interactions
-            #     pyats_command_results=collected_pyats_results,
-            #     connectivity_test_results=connectivity_test_results_agg,
-            #     llm_analysis=llm_analysis_result
-            # )
-            # Placeholder until ReportBuilder is implemented
-            logger.warning("ReportBuilder.generate_report() is stubbed.")
-            final_report = TroubleshootingReport(
+        # 4. Build and return the report (FR13, FR14)
+        if not self.report_builder:
+            logger.error("ReportBuilder is not initialized. Cannot generate a report.")
+            # Return a minimal report or raise an error
+            # For now, creating a basic TroubleshootingReport with available data
+            return TroubleshootingReport(
                 request_type="alarm",
                 original_request=alarm_details,
                 target_scope=target_scope,
-                investigation_summary=investigation_summary,
-                devices_investigated=investigated_devices,
-                pyats_command_results=collected_pyats_results,
+                investigation_summary=investigation_summary + " ReportBuilder failed to initialize.",
+                devices_investigated=list(set(res.device_hostname for res in collected_pyats_results)),
                 connectivity_test_results=connectivity_test_results_agg,
+                pyats_command_results=collected_pyats_results,
                 llm_analysis=llm_analysis_result
             )
-        else:
-            logger.warning("ReportBuilder not available. Constructing report directly in manager.")
-            final_report = TroubleshootingReport(
-                request_type="alarm",
-                original_request=alarm_details,
-                target_scope=target_scope,
-                investigation_summary=investigation_summary,
-                devices_investigated=investigated_devices, # Refine based on actual device interaction
-                pyats_command_results=collected_pyats_results,
-                connectivity_test_results=connectivity_test_results_agg,
-                llm_analysis=llm_analysis_result
-            )
-        
-        logger.info(f"Alarm processing complete for: '{alarm_details.description[:50]}...'")
+
+        final_report = self.report_builder.build_report(
+            request_type="alarm",
+            original_request=alarm_details,
+            target_scope=target_scope,
+            investigation_summary=investigation_summary,
+            devices_investigated=list(set(res.device_hostname for res in collected_pyats_results)), # Unique list
+            pyats_results=collected_pyats_results,
+            connectivity_tests=connectivity_test_results_agg,
+            llm_analysis=llm_analysis_result,
+        )
+        logger.info(f"Alarm processing complete for: '{alarm_details.description[:50]}...'. Report generated.")
         return final_report
 
     async def process_user_query(
-        self, query_input: UserQueryInput
-    ) -> Union[TroubleshootingReport, InterimChatResponse]:
+        self, query: str, target_scope: TargetScope, 
+        chat_history: Optional[List[Dict[str, str]]] = None, # Conforms to LLMHandler expected input
+        file_uploads: Optional[List[Dict[str, str]]] = None # Simplified for now
+    ) -> Union[TroubleshootingReport, InterimChatResponse]: # FR17
         """
         Processes an interactive user query. (FR17)
 
         Orchestrates LLM interaction (via Pydantic AI) and pyATS usage
-        based on user query and context. Can result in an interim chat response
-        or a final troubleshooting report.
+        based on user query and context. Can return an interim chat response
+        or a full troubleshooting report.
 
         Args:
-            query_input: Contains the user's query, target scope, chat history, and file uploads.
+            query: User's natural language query.
+            target_scope: Defines the scope of the troubleshooting.
+            chat_history: Conversation history.
+            file_uploads: Uploaded files for context (e.g., log snippets).
+                          Each dict: {"filename": "...", "content": "..."}
 
         Returns:
             Either a TroubleshootingReport or an InterimChatResponse.
         """
-        logger.info(f"Processing user query: {query_input.query[:50]}... for target: {query_input.target_scope.model_dump_json(exclude_none=True)}")
+        logger.info(f"Processing user query: '{query[:100]}...' for target: {target_scope.model_dump_json(exclude_none=True)}")
 
-        # 1. Prepare context for the first LLM call
-        # FR4: Conversation History Management (used from input)
-        # FR11: Data Preparation for LLM
-        chat_history_for_llm = []
-        if query_input.chat_history:
-            for msg in query_input.chat_history:
-                chat_history_for_llm.append({"role": msg.role, "content": msg.content})
+        # This is a simplified initial structure for process_user_query.
+        # A full implementation would involve a loop for conversation,
+        # state management, and deciding when to finalize a report vs. continue chatting.
 
-        current_context_parts = [f"User Query: {query_input.query}"]
-        if query_input.target_scope:
-            current_context_parts.append(f"Target Scope: {query_input.target_scope.model_dump_json(exclude_none=True)}")
-        if query_input.file_uploads:
-            current_context_parts.append("Uploaded Files:")
-            for f_upload in query_input.file_uploads:
-                current_context_parts.append(f"  - {f_upload.filename}: {f_upload.content[:100]}...") # Truncate content
+        # 1. Prepare context for LLM
+        full_query_context_parts = [f"User Query: {query}"]
+        if target_scope.device_hostnames:
+            full_query_context_parts.append(f"Target Devices: {', '.join(target_scope.device_hostnames)}")
+        if target_scope.market_or_region:
+            full_query_context_parts.append(f"Target Scope: {target_scope.market_or_region}")
 
-        current_context_str = "\\n".join(current_context_parts)
-        capabilities_summary = f"Supported pyATS commands: {', '.join(self.settings.allowed_pyats_commands)}. You can also ask for user clarification."
+        if file_uploads:
+            full_query_context_parts.append("\\nUploaded Files Context:")
+            for upload in file_uploads:
+                full_query_context_parts.append(f"  Filename: {upload.get('filename', 'N/A')}")
+                full_query_context_parts.append(f"  Content Snippet: {str(upload.get('content', ''))[:200]}...") # Truncate
 
-        # 2. First LLM call to decide action (clarify, get data, or simple thought)
-        # FR2, FR3, FR5
-        llm_prompt_for_action = (
-            "Based on the user's query, chat history, target scope, and any uploaded files, determine the best course of action. "
-            "You can: \\n"
-            "1. Ask a clarifying question to the user (use 'ask_user_clarification').\\n"
-            "2. Request specific pyATS commands to be run on devices (use 'pyats_commands').\\n"
-            "3. Provide a direct thought or initial assessment if no immediate data is needed or if the query is general (use 'thought')."
-        )
+        current_context_str = "\\n".join(full_query_context_parts)
         
+        capabilities_summary = f"Supported pyATS commands include: {', '.join(self.settings.allowed_pyats_commands)}. " \\
+                               "You can also ask for user clarification."
+
+        # 2. Interact with LLM: Understand query, request data, or ask clarification
+        # For user queries, the LLM might respond with a direct answer, a request for pyATS commands,
+        # or a clarifying question. We'll use LLMDataRequestAction for now, but might need a more
+        # general LLM response model for chat.
         try:
-            logger.debug("Attempting LLM call for action planning in process_user_query.")
-            llm_action_request = await self.llm_handler.get_structured_response(
-                user_query=llm_prompt_for_action, # The query here is our instruction to the LLM
-                output_model=LLMDataRequestAction,
-                current_context=current_context_str, # User's actual query and context
-                chat_history=chat_history_for_llm,
+            logger.debug("Attempting LLM call for user query understanding and action planning.")
+            llm_response_action = await self.llm_handler.get_structured_response(
+                user_query=query, # The user's latest query is the main prompt part
+                output_model=LLMDataRequestAction, # Re-using this model for now
+                current_context=current_context_str, # Provides combined context of query + files
+                chat_history=chat_history, # Passes along the history
                 pyats_capabilities_summary=capabilities_summary
             )
-            logger.info(f"LLM suggested action: Thought: '{llm_action_request.thought}', Commands: {len(llm_action_request.pyats_commands or [])}, Clarification: '{llm_action_request.ask_user_clarification}'")
+            logger.info(f"LLM response to user query: Thought: {llm_response_action.thought or 'N/A'}")
 
-        except Exception as e:
-            logger.error(f"Error during LLM action planning in process_user_query: {e}", exc_info=True)
-            return InterimChatResponse(assistant_message=f"I encountered an error trying to understand your request: {e}")
-
-        # 3. Process LLM's suggested action
-        if llm_action_request.ask_user_clarification:
-            logger.info(f"LLM requests clarification: {llm_action_request.ask_user_clarification}")
-            return InterimChatResponse(assistant_message=llm_action_request.ask_user_clarification)
-
-        elif llm_action_request.pyats_commands and self.pyats_handler:
-            logger.info(f"LLM requests {len(llm_action_request.pyats_commands)} pyATS command(s). Executing (stubbed)...")
+            # 3. Process LLM's response
             collected_pyats_results: List[PyATSCommandResult] = []
             connectivity_test_results_agg: List[ConnectivityTestResult] = []
-            
-            # FR7, FR8, FR9 (Conceptual execution)
-            for cmd_req in llm_action_request.pyats_commands:
-                devices_to_run_on = cmd_req.devices or query_input.target_scope.device_hostnames or []
-                if not devices_to_run_on:
-                    logger.warning(f"No target devices for command '{cmd_req.command}', skipping.")
-                    continue
-                # This would be: results, conn_tests = await self.pyats_handler.execute_command_on_devices(...)
-                logger.warning(f"PyATS command execution for '{cmd_req.command}' on {devices_to_run_on} is stubbed.")
-                for device_name in devices_to_run_on:
-                    collected_pyats_results.append(PyATSCommandResult(
-                        device_hostname=device_name, command=cmd_req.command,
-                        raw_output=f"Stubbed output for {cmd_req.command} on {device_name}",
-                        error="Stubbed execution - PyATSHandler not fully integrated."
-                    ))
-            
-            # Prepare context for the second LLM call (analysis)
-            analysis_context_parts = [current_context_str, "\\nCollected pyATS Data:"]
-            for res in collected_pyats_results:
-                analysis_context_parts.append(f"  Device: {res.device_hostname}, Command: {res.command}, Output: {res.raw_output[:100]}... Error: {res.error}")
-            # Add connectivity tests if available
-            analysis_context_str = "\\n".join(analysis_context_parts)
-            
-            llm_prompt_for_analysis = (
-                "Analyze the user's original request, conversation history, and the recently collected pyATS command results. "
-                "Provide a comprehensive analysis including key findings, potential root causes, and suggested next steps. "
-                "This will form the basis of a troubleshooting report or a detailed interim response."
-            )
-            try:
-                logger.debug("Attempting LLM call for analysis after data collection.")
-                llm_analysis = await self.llm_handler.get_structured_response(
-                    user_query=llm_prompt_for_analysis,
-                    output_model=LLMAnalysisResult,
-                    current_context=analysis_context_str, # Includes original query + new data
-                    chat_history=chat_history_for_llm 
+            investigation_summary = f"Investigation based on user query: {query[:50]}..."
+
+            if llm_response_action.pyats_commands and self.pyats_handler:
+                logger.info(f"LLM requested {len(llm_response_action.pyats_commands)} pyATS command(s).")
+                # Similar command execution logic as in process_alarm
+                unique_commands_from_llm = list(set(cmd_req.command for cmd_req in llm_response_action.pyats_commands if cmd_req.command))
+                for command_str in unique_commands_from_llm:
+                    devices_for_current_command = []
+                    for cmd_req in llm_response_action.pyats_commands:
+                        if cmd_req.command == command_str:
+                            devices_for_current_command.extend(cmd_req.devices or target_scope.device_hostnames or [])
+                    unique_devices_for_command = sorted(list(set(d for d in devices_for_current_command if d)))
+
+                    if not unique_devices_for_command:
+                        logger.warning(f"No target devices for command '{command_str}' in user query flow, skipping.")
+                        continue
+                    
+                    results, conn_tests = await self.pyats_handler.execute_command_on_devices(
+                        device_names=unique_devices_for_command,
+                        command_to_execute=command_str
+                    )
+                    collected_pyats_results.extend(results)
+                    connectivity_test_results_agg.extend(conn_tests)
+                investigation_summary += f" Executed {len(unique_commands_from_llm)} command(s)."
+
+            elif llm_response_action.pyats_commands and not self.pyats_handler:
+                logger.warning("PyATSHandler not available. Cannot execute LLM-requested commands for user query.")
+                investigation_summary += " PyATSHandler not available, commands not executed."
+                # Potentially return an interim response indicating this issue.
+                return InterimChatResponse(
+                    assistant_message="I identified some commands to run, but I'm currently unable to connect to network devices. Please check my configuration."
                 )
-                logger.info(f"LLM analysis received: {llm_analysis.overall_assessment[:100]}...")
+
+
+            # 4. Second LLM interaction (if data was collected) or formulate response
+            llm_analysis_result: Optional[LLMAnalysisResult] = None
+            if collected_pyats_results:
+                analysis_context_parts = [current_context_str, "\\nCollected pyATS Data:"]
+                for res in collected_pyats_results:
+                    analysis_context_parts.append(f"  Device: {res.device_hostname}, Command: {res.command}")
+                    if res.parsed_output:
+                        analysis_context_parts.append(f"    Parsed: {str(res.parsed_output)[:200]}...")
+                    elif res.raw_output:
+                        analysis_context_parts.append(f"    Raw Output: {res.raw_output[:200]}...")
+                    if res.error:
+                        analysis_context_parts.append(f"    Error: {res.error}")
+                if connectivity_test_results_agg:
+                    analysis_context_parts.append("\\nConnectivity Test Results:")
+                    for conn_test in connectivity_test_results_agg:
+                        details_str = f"Target: {conn_test.target}, Success: {conn_test.success}"
+                        if conn_test.details:
+                            details_str += f", Details: {str(conn_test.details)[:100]}..."
+                        analysis_context_parts.append(f"  - {conn_test.test_type}: {details_str}")
                 
-                # FR13, FR14: Generate and return TroubleshootingReport
-                report = TroubleshootingReport(
-                    request_type="user_query",
-                    original_request=query_input,
-                    target_scope=query_input.target_scope,
-                    investigation_summary=f"Investigation based on user query and {len(collected_pyats_results)} executed commands (stubbed). LLM thought: {llm_action_request.thought or 'N/A'}",
-                    devices_investigated=list(set(dr.device_hostname for dr in collected_pyats_results)),
-                    pyats_command_results=collected_pyats_results,
-                    connectivity_test_results=connectivity_test_results_agg,
-                    llm_analysis=llm_analysis
+                analysis_context_str_for_llm = "\\n".join(analysis_context_parts)
+                analysis_llm_query = (
+                    "Analyze the user's query, chat history, uploaded files (if any), and the collected device data. "
+                    "Provide an overall assessment, key findings, potential root causes, and suggested next steps. "
+                    "If the query seems fully addressed, provide a comprehensive answer. "
+                    "If more information or steps are needed, you can also ask a clarifying question."
                 )
-                # if self.report_builder: report = self.report_builder.generate_report(...) # Conceptual
-                return report
+                # For user queries, the response might be another question or a final analysis.
+                # We might need a more flexible output model here, e.g., one that includes
+                # both LLMAnalysisResult fields and an optional 'ask_user_clarification' field.
+                # For now, we'll assume if data is collected, we aim for an LLMAnalysisResult.
+                try:
+                    llm_analysis_result = await self.llm_handler.get_structured_response(
+                        user_query=analysis_llm_query, # This is more of an instruction now
+                        output_model=LLMAnalysisResult, # Expecting a full analysis
+                        current_context=analysis_context_str_for_llm, # Context includes original query + data
+                        chat_history=chat_history
+                    )
+                    investigation_summary += f" LLM analysis of collected data completed."
+                except Exception as e:
+                    logger.error(f"Error during LLM analysis for user query: {e}", exc_info=True)
+                    return InterimChatResponse(assistant_message=f"I encountered an error trying to analyze the collected data: {e}")
 
-            except Exception as e:
-                logger.error(f"Error during LLM analysis in process_user_query: {e}", exc_info=True)
-                return InterimChatResponse(assistant_message=f"I gathered some data but encountered an error during analysis: {e}")
-
-        elif llm_action_request.pyats_commands and not self.pyats_handler:
-            logger.warning("LLM requested pyATS commands, but PyATSHandler is not available.")
-            return InterimChatResponse(assistant_message="I'd like to run some device commands, but I'm currently unable to connect to devices. Please check my configuration.")
-
-        elif llm_action_request.thought:
-            logger.info(f"LLM provided a thought: {llm_action_request.thought}")
-            return InterimChatResponse(assistant_message=llm_action_request.thought)
+            # 5. Decide on response type: InterimChatResponse or TroubleshootingReport
+            if llm_response_action.ask_user_clarification and not collected_pyats_results:
+                # If LLM asked a question and didn't run commands, it's an interim response.
+                logger.info(f"LLM is asking for clarification from user: {llm_response_action.ask_user_clarification}")
+                return InterimChatResponse(assistant_message=llm_response_action.ask_user_clarification)
             
-        else: # LLM returned no specific action
-            logger.warning("LLM did not suggest a clear action (no clarification, commands, or thought).")
-            return InterimChatResponse(assistant_message="I'm not sure how to proceed with that. Could you please rephrase or provide more details?")
+            if llm_analysis_result: # If we have an analysis (from data or direct query)
+                # This implies a more "final" answer for the current turn.
+                # In a true conversational flow, we'd need more logic to decide if it's THE final report.
+                # For now, if analysis is produced, we generate a report.
+                if not self.report_builder:
+                    logger.error("ReportBuilder not initialized. Cannot generate report for user query.")
+                    return InterimChatResponse(assistant_message="I have processed your query and have some findings, but I'm unable to generate a formatted report at the moment.")
 
-    def get_supported_capabilities(self) -> SupportedCapabilities:
+                # Constructing UserQueryInput for the report
+                original_request_for_report = UserQueryInput(
+                    query=query,
+                    target_scope=target_scope,
+                    chat_history=[ChatMessage(**msg) for msg in chat_history] if chat_history else [],
+                    file_uploads=[FileUpload(**up) for up in file_uploads] if file_uploads else []
+                )
+
+                final_report = self.report_builder.build_report(
+                    request_type="user_query",
+                    original_request=original_request_for_report,
+                    target_scope=target_scope,
+                    investigation_summary=investigation_summary,
+                    devices_investigated=list(set(res.device_hostname for res in collected_pyats_results)),
+                    pyats_results=collected_pyats_results,
+                    connectivity_tests=connectivity_test_results_agg,
+                    llm_analysis=llm_analysis_result,
+                )
+                logger.info(f"User query processing generated a full report. Query: '{query[:50]}...'")
+                return final_report
+            elif not llm_response_action.pyats_commands and not llm_response_action.ask_user_clarification:
+                # LLM didn't ask for commands and didn't ask a question, but also didn't produce data for analysis.
+                # This could be a direct answer from the LLM's knowledge.
+                # The LLMDataRequestAction.thought might contain this answer.
+                # This part needs refinement based on how Pydantic AI agent is used for direct Q&A.
+                # For now, if 'thought' exists, return it as an interim response.
+                direct_answer = llm_response_action.thought or "I've processed your query. Is there anything else I can help with?"
+                logger.info(f"LLM provided a direct response/thought: {direct_answer[:100]}...")
+                return InterimChatResponse(assistant_message=direct_answer)
+            else:
+                # Fallback or if only commands were issued but no subsequent analysis was triggered (should be rare)
+                logger.warning("User query processing ended in an unexpected state. Defaulting to generic interim response.")
+                return InterimChatResponse(assistant_message="I've processed your request. If commands were run, I'll analyze the data. If not, I might need more information or your query was general.")
+
+
+    def get_supported_capabilities(self) -> SupportedCapabilities: # FR5 (Exposing capabilities)
         """
-        Returns the data gathering capabilities of the module. (FR5 - informing LLM)
-
-        This primarily lists supported pyATS commands.
-
-        Returns:
-            A dictionary describing supported capabilities.
+        Returns the data gathering capabilities of the module.
+        This informs how the LLM can be prompted about what it can ask the module to do.
         """
         logger.debug("Fetching supported capabilities.")
         return SupportedCapabilities(
-            supported_pyats_commands=self.settings.allowed_pyats_commands
+            supported_pyats_commands=list(self.settings.allowed_pyats_commands)
+            # Future: Could add other capabilities, e.g., "can_analyze_syslogs_if_provided"
         )
 
 # Example usage (for testing, typically not in the module itself)
