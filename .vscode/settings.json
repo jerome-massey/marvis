@@ -1,0 +1,13 @@
+{
+  "github.copilot.chat.codeGeneration.instructions": [
+    {
+      "file": "./docs/requirements.md"
+    },
+    {
+      "file": "./docs/preferred-libraries.md"
+    },
+    {
+      "file": "./docs/code-styles-python.md"
+    }
+  ]
+}
