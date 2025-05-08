@@ -1,0 +1,21 @@
+[project]
+name = "marvis-module"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyats",
+    "genie",
+    "pydantic-ai",
+    "openai",
+    "google-generativeai",
+    "pydantic",
+    "python-dotenv",
+    "pytest",
+    "pythonping",
+    "dnspython",
+    "rich",
+    "typer",
+    "httpx",
+]
